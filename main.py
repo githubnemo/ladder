@@ -21,8 +21,6 @@ parser.add_argument('--log-interval', type=int, default=10, metavar='N',
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 
-print(torch.cuda.is_available())
-
 
 torch.manual_seed(args.seed)
 if args.cuda:
@@ -121,7 +119,7 @@ class LN(nn.Module):
         recs = [l0_recon, l1_recon, l2_recon, l3_recon]
         sup = e3_noisy_act
 
-        return sup, refs, recs
+        return sup, (refs, recs)
 
 
 class AE(nn.Module):
@@ -239,13 +237,43 @@ optimizer = optim.Adam(model.parameters(), lr=0.002)
 dae_weights = [1000, 10, 0.1, 0.1]
 
 
+def dae_loss(x, _):
+    recons, refs = x
+    uns = 0
+
+    for i, _ in enumerate(recons):
+        mean = refs[i].mean(dim=1).expand(refs[i].size())
+        std = refs[i].std(dim=1).expand(refs[i].size())
+        refs[i] = (refs[i] - mean) / std
+        recons[i] = (recons[i] - mean) / std
+        uns += mse(recons[i], refs[i].detach()) * dae_weights[i]
+
+    return uns * 1/len(recons)
+
+
 from torchsample.modules import ModuleTrainer
 
 trainer = ModuleTrainer(model)
 
 trainer.compile(loss=['nll_loss', dae_loss],
+                metrics=['accuracy'],
                 optimizer='adam')
-trainer.fit_loader(train_loader, nb_epoch=10)
+
+class LoadWrap(object):
+    def __init__(self, loader):
+        self.loader = loader
+        self.dataset = loader.dataset
+        self.batch_size = loader.batch_size
+
+    def _iter(self):
+        for i, (data, target) in enumerate(self.loader):
+            yield (data, [target, None])
+
+    def __iter__(self):
+        return self._iter()
+
+
+trainer.fit_loader(LoadWrap(train_loader), nb_epoch=10, cuda_device=0)
 
 
 def train(epoch):
@@ -257,7 +285,7 @@ def train(epoch):
             data = data.cuda()
             label = label.cuda()
         optimizer.zero_grad()
-        y_pred, refs, recs = model(data)
+        y_pred, (refs, recs) = model(data)
         loss, sl, ul = ln_loss_function(recs, refs, dae_weights, y_pred, label)
         loss.backward()
         train_loss += loss.data[0]
