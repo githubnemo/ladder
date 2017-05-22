@@ -237,45 +237,6 @@ optimizer = optim.Adam(model.parameters(), lr=0.002)
 dae_weights = [1000, 10, 0.1, 0.1]
 
 
-def dae_loss(x, _):
-    recons, refs = x
-    uns = 0
-
-    for i, _ in enumerate(recons):
-        mean = refs[i].mean(dim=1).expand(refs[i].size())
-        std = refs[i].std(dim=1).expand(refs[i].size())
-        refs[i] = (refs[i] - mean) / std
-        recons[i] = (recons[i] - mean) / std
-        uns += mse(recons[i], refs[i].detach()) * dae_weights[i]
-
-    return uns * 1/len(recons)
-
-
-from torchsample.modules import ModuleTrainer
-
-trainer = ModuleTrainer(model)
-
-trainer.compile(loss=['nll_loss', dae_loss],
-                metrics=['accuracy'],
-                optimizer='adam')
-
-class LoadWrap(object):
-    def __init__(self, loader):
-        self.loader = loader
-        self.dataset = loader.dataset
-        self.batch_size = loader.batch_size
-
-    def _iter(self):
-        for i, (data, target) in enumerate(self.loader):
-            yield (data, [target, None])
-
-    def __iter__(self):
-        return self._iter()
-
-
-trainer.fit_loader(LoadWrap(train_loader), nb_epoch=10, cuda_device=0)
-
-
 def train(epoch):
     model.train()
     train_loss = 0
