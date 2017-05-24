@@ -31,7 +31,13 @@ kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
 train_loader = torch.utils.data.DataLoader(
     datasets.MNIST('../data', train=True, download=True,
                    transform=transforms.ToTensor()),
-    batch_size=args.batch_size, shuffle=True, **kwargs)
+    batch_size=args.batch_size, shuffle=True,
+    sampler=torch.utils.data.sampler.SubsetRandomSampler(list(range(0,10000))),
+    **kwargs)
+val_loader = torch.utils.data.DataLoader(
+    datasets.MNIST('../data', train=True, transform=transforms.ToTensor()),
+    batch_size=args.batch_size, shuffle=False,
+    sampler=torch.utils.data.sampler.SubsetRandomSampler(list(range(50000,60000))), **kwargs)
 test_loader = torch.utils.data.DataLoader(
     datasets.MNIST('../data', train=False, transform=transforms.ToTensor()),
     batch_size=args.batch_size, shuffle=True, **kwargs)
@@ -50,19 +56,16 @@ class MLPCombinator(nn.Module):
     def __init__(self, input_shape):
         super(MLPCombinator, self).__init__()
 
-        self.ls1 = nn.Linear(input_shape, input_shape)
-        self.ls2 = nn.Linear(input_shape, input_shape, bias=False)
-        self.ls3 = nn.Linear(input_shape, input_shape, bias=False)
+        self.ls1 = nn.Linear(3*input_shape, input_shape)
 
-        self.l1 = nn.Linear(input_shape, input_shape)
-        self.l2 = nn.Linear(input_shape, input_shape, bias=False)
-        self.l3 = nn.Linear(input_shape, input_shape, bias=False)
+        self.l1 = nn.Linear(3*input_shape, input_shape)
 
         self.sig = nn.Sigmoid()
 
     def forward(self, u, z):
-        s = self.sig(self.ls1(u) + self.ls2(z) + self.ls3(u*z))
-        return s + self.l1(u) + self.l2(z) + self.l3(u*z)
+        x = torch.cat((u, z, u*z), dim=1)
+        s = self.sig(self.ls1(x))
+        return s + self.l1(x)
 
 
 class LN(nn.Module):
@@ -237,30 +240,74 @@ optimizer = optim.Adam(model.parameters(), lr=0.002)
 dae_weights = [1000, 10, 0.1, 0.1]
 
 
-def train(epoch):
+import torchsample
+
+trainer = torchsample.modules.ModuleTrainer(None)
+
+callbacks = [
+    trainer.history,
+    torchsample.callbacks.TQDM(),
+]
+
+
+def run_callbacks(method, *args, **kwargs):
+    [getattr(c,method)(*args, **kwargs) for c in callbacks]
+
+def train(epoch, epoch_logs, metrics):
     model.train()
     train_loss = 0
+
     for batch_idx, (data, label) in enumerate(train_loader):
         data, label = Variable(data), Variable(label)
         if args.cuda:
             data = data.cuda()
             label = label.cuda()
         optimizer.zero_grad()
+
+        batch_logs = {
+            'batch_idx': batch_idx,
+            'batch_samples': args.batch_size,
+        }
+        run_callbacks("on_batch_begin", batch_idx, batch_logs)
+
         y_pred, (refs, recs) = model(data)
         loss, sl, ul = ln_loss_function(recs, refs, dae_weights, y_pred, label)
         loss.backward()
         train_loss += loss.data[0]
         optimizer.step()
+
+        """
         if batch_idx % args.log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
                 100. * batch_idx / len(train_loader),
                 loss.data[0] / len(data)))
             print(sl, ul)
+        """
+
+        batch_logs['loss'] = loss.data[0]
+        epoch_logs['loss'] = loss.data[0]
+
+        batch_logs.update(metrics(y_pred, label))
+
+        run_callbacks("on_batch_end", batch_idx, batch_logs)
 
     print('====> Epoch: {} Average loss: {:.4f}'.format(
           epoch, train_loss / len(train_loader.dataset)))
 
+def validate(val_metrics):
+    total_loss = 0
+    for batch_idx, (data, label) in enumerate(val_loader):
+        data, label = Variable(data), Variable(label)
+        if args.cuda:
+            data = data.cuda()
+            label = label.cuda()
+        y_pred, (refs, recs) = model(data)
+
+        val_loss, *_ = ln_loss_function(recs, refs, dae_weights, y_pred, label)
+        total_loss += val_loss
+
+    return total_loss / float(len(val_loader) * args.batch_size), val_metrics(y_pred, label)
 
 def test(epoch):
     model.eval()
@@ -274,6 +321,29 @@ def test(epoch):
     print('====> Test set loss: {:.4f}'.format(test_loss))
 
 
+run_callbacks("set_model", trainer)
+run_callbacks("on_train_begin", {'has_validation_data': False})
+
+trainer.add_metric('accuracy')
+
+metrics = torchsample.metrics.MetricsModule(trainer._metrics)
+val_metrics = torchsample.metrics.MetricsModule(trainer._metrics, prefix='val_')
+
 for epoch in range(1, args.epochs + 1):
-    train(epoch)
+    epoch_logs = {'nb_epoch': args.epochs, 'nb_batches': len(train_loader), 'has_validation_data': False}
+
+    run_callbacks("on_epoch_begin", epoch-1, epoch_logs)
+    train(epoch, epoch_logs, metrics)
     #test(epoch)
+
+    val_loss, val_metric_logs = validate(val_metrics)
+
+    print(trainer.history.batch_metrics.items())
+
+    trainer.history.batch_metrics['val_loss'] = val_loss
+
+    epoch_logs.update(trainer.history.batch_metrics)
+    epoch_logs.update({k.split('_metric')[0]:v for k,v in val_metric_logs.items()})
+
+
+    run_callbacks("on_epoch_end", epoch-1, epoch_logs)

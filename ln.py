@@ -10,6 +10,8 @@ from torchvision import datasets, transforms
 parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
 parser.add_argument('--batch-size', type=int, default=128, metavar='N',
                     help='input batch size for training (default: 64)')
+parser.add_argument('--train-samples', type=int, default=50000)
+parser.add_argument('--validation-samples', type=int, default=10000)
 parser.add_argument('--epochs', type=int, default=10, metavar='N',
                     help='number of epochs to train (default: 2)')
 parser.add_argument('--no-cuda', action='store_true', default=False,
@@ -31,13 +33,12 @@ kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
 train_loader = torch.utils.data.DataLoader(
     datasets.MNIST('../data', train=True, download=True,
                    transform=transforms.ToTensor()),
-    batch_size=args.batch_size, shuffle=True,
-    sampler=torch.utils.data.sampler.SubsetRandomSampler(list(range(0,50000))),
-    **kwargs)
+    sampler=torch.utils.data.sampler.SubsetRandomSampler(list(range(0,args.train_samples))),
+    batch_size=args.batch_size, shuffle=True, **kwargs)
 val_loader = torch.utils.data.DataLoader(
     datasets.MNIST('../data', train=True, transform=transforms.ToTensor()),
     batch_size=args.batch_size, shuffle=False,
-    sampler=torch.utils.data.sampler.SubsetRandomSampler(list(range(50000,60000))), **kwargs)
+    sampler=torch.utils.data.sampler.SubsetRandomSampler(list(range(args.train_samples,args.train_samples+args.validation_samples))), **kwargs)
 test_loader = torch.utils.data.DataLoader(
     datasets.MNIST('../data', train=False, transform=transforms.ToTensor()),
     batch_size=args.batch_size, shuffle=True, **kwargs)
@@ -119,9 +120,10 @@ class LN(nn.Module):
 
         refs = [e0_clean, e1_clean, e2_clean, e3_clean]
         recs = [l0_recon, l1_recon, l2_recon, l3_recon]
-        sup = e3_noisy_act
+        sup_noisy = e3_noisy_act
+        sup_clean = e3_clean_act
 
-        return sup, (refs, recs)
+        return sup_noisy, sup_clean, (refs, recs)
 
 
 model = LN()
@@ -166,18 +168,26 @@ def train(epoch):
             label = label.cuda()
         optimizer.zero_grad()
 
-        y_pred, (refs, recs) = model(data)
-        loss, sl, ul = ln_loss_function(recs, refs, dae_weights, y_pred, label)
+        y_pred_noisy,  y_pred_clean, (refs, recs) = model(data)
+        loss, sl, ul = ln_loss_function(recs, refs, dae_weights, y_pred_noisy, label)
         loss.backward()
         train_loss += loss.data[0]
         optimizer.step()
 
         if batch_idx % args.log_interval == 0:
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                epoch, batch_idx * len(data), len(train_loader.dataset),
-                100. * batch_idx / len(train_loader),
-                loss.data[0] / len(data)))
-            print(sl, ul)
+            from scipy.misc import imsave
+            imsave('refs_0_0.png', refs[0][0].data.numpy().reshape((28,28)))
+            imsave('recs_0_0.png', recs[0][0].data.numpy().reshape((28,28)))
+
+            print('Train Epoch: {epoch} [{bidx:8}/{batches:8} ({bperc:3.0f}%)]\tLoss: {loss:.6f} sup: {sup:.6f} dae: {dae:.6f}'.format(**{
+                'epoch': epoch,
+                'bidx': batch_idx * len(data),
+                'batches': len(train_loader.dataset),
+                'bperc': 100. * batch_idx / len(train_loader),
+                'loss': loss.data[0] / len(data),
+                'sup': sl.data[0],
+                'dae': ul.data[0],
+            }))
 
     print('====> Epoch: {} Average loss: {:.4f}'.format(
           epoch, train_loss / len(train_loader.dataset)))
@@ -191,13 +201,13 @@ def validate(epoch):
         if args.cuda:
             data = data.cuda()
             label = label.cuda()
-        y_pred, (refs, recs) = model(data)
+        y_pred_noisy, y_pred_clean, (refs, recs) = model(data)
 
-        val_loss, *_ = ln_loss_function(recs, refs, dae_weights, y_pred, label)
-        total_loss += val_loss
+        val_loss, *_ = ln_loss_function(recs, refs, dae_weights, y_pred_clean, label)
+        total_loss += val_loss.data[0]
 
     total_loss /= float(len(val_loader) * args.batch_size)
-    print("====> Validation set loss: {:.4f}".format(total_loss))
+    print('====> Validation set loss: {:.4f}'.format(total_loss))
 
 def test(epoch):
     model.eval()
