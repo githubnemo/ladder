@@ -12,12 +12,18 @@ parser.add_argument('--batch-size', type=int, default=128, metavar='N',
                     help='input batch size for training (default: 64)')
 parser.add_argument('--train-samples', type=int, default=50000)
 parser.add_argument('--validation-samples', type=int, default=10000)
+parser.add_argument('--noise-sigma', type=float, default=0.3)
 parser.add_argument('--epochs', type=int, default=10, metavar='N',
                     help='number of epochs to train (default: 2)')
 parser.add_argument('--no-cuda', action='store_true', default=False,
                     help='enables CUDA training')
+parser.add_argument('--loss-torch-mse', action='store_true',
+                    help='use torch builtin MSE for recon loss instead of manual comp. to avoid need for detach')
+parser.add_argument('--loss-normalization', type=str, choices=['ladder','mean','none'], default='ladder')
 parser.add_argument('--seed', type=int, default=1, metavar='S',
                     help='random seed (default: 1)')
+parser.add_argument('--parallel-encoder', action='store_true',
+                    help='Execute noisy and clean encoder in parallel (default: off)')
 parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                     help='how many batches to wait before logging training status')
 args = parser.parse_args()
@@ -68,13 +74,55 @@ class MLPCombinator(nn.Module):
         return self.l2(torch.cat((x,s), dim=1))
 
 
+class Encoder(nn.Module):
+    def __init__(self, layers, acts, noise_std=0.):
+        super().__init__()
+        self.acts = acts
+        self.layers = layers
+        self.noise_std = noise_std
+
+    def noise(self, x):
+        noise = Variable(torch.randn(x.size()) * self.noise_std)
+        if args.cuda:
+            noise = noise.cuda()
+        return x + noise
+
+    def encode(self, layer, act, x):
+        if self.noise_std > 0:
+            y = self.noise(layer(x))
+        else:
+            y = layer(x)
+        y_act = act(y)
+        return y, y_act
+
+    def forward(self, e0):
+        if self.noise_std > 0:
+            e0 = self.noise(e0)
+
+        e_act = e0
+        pres = [e0]
+        acts = []
+
+        for (layer,act) in zip(self.layers, self.acts):
+            e_pre, e_act = self.encode(layer, act, e_act)
+            pres += [e_pre]
+            acts += [e_act]
+
+        return pres, acts
+
 class LN(nn.Module):
-    def __init__(self):
+    def __init__(self, parallel_encoder=False):
         super(LN, self).__init__()
+
+        self.parallel_encoder = parallel_encoder
+
+        self.relu = nn.ReLU()
+        self.softmax = nn.LogSoftmax()
 
         self.e1 = nn.Linear(784, 300)
         self.e2 = nn.Linear(300, 20)
         self.e3 = nn.Linear(20, 10)
+
         self.d3 = nn.Linear(10, 20)
         self.d2 = nn.Linear(20, 300)
         self.d1 = nn.Linear(300, 784)
@@ -84,31 +132,22 @@ class LN(nn.Module):
         self.g1 = MLPCombinator(300)
         self.g0 = MLPCombinator(784)
 
-        self.relu = nn.ReLU()
-        self.softmax = nn.LogSoftmax()
+        acts = [self.relu, self.relu, self.softmax]
+        layers = [self.e1, self.e2, self.e3]
 
-        self.noise_std = 0.3
+        self.e_noisy = Encoder(layers=layers, acts=acts, noise_std=args.noise_sigma)
+        self.e_clean = Encoder(layers=layers, acts=acts, noise_std=0.0)
 
-    def noise(self, x):
-        noise = Variable(torch.randn(x.size()) * self.noise_std)
-        if args.cuda:
-            noise = noise.cuda()
-        return x + noise
+        if self.parallel_encoder:
+            self.e_noisy = torch.nn.DataParallel(self.e_noisy, device_ids=[0])
+            self.e_clean = torch.nn.DataParallel(self.e_clean, device_ids=[0])
 
-    def encode(self, layer, act, x_clean, x_noisy):
-        e_clean = layer(x_clean)
-        e_noisy = self.noise(layer(x_noisy))
-        e_clean_act = act(e_clean)
-        e_noisy_act = act(e_noisy)
-        return e_clean, e_noisy, e_clean_act, e_noisy_act
 
     def forward(self, x):
-        e0_clean = x.view(-1, 784)
-        e0_noisy = self.noise(x.view(-1,784))
+        x = x.view(-1, 784)
 
-        e1_clean, e1_noisy, e1_clean_act, e1_noisy_act = self.encode(self.e1, self.relu, e0_clean, e0_noisy)
-        e2_clean, e2_noisy, e2_clean_act, e2_noisy_act = self.encode(self.e2, self.relu, e1_clean, e1_noisy)
-        e3_clean, e3_noisy, e3_clean_act, e3_noisy_act = self.encode(self.e3, self.softmax, e2_clean, e2_noisy)
+        (e0_clean,e1_clean,e2_clean,e3_clean), (e1_clean_act,e2_clean_act,e3_clean_act) = self.e_clean(x)
+        (e0_noisy,e1_noisy,e2_noisy,e3_noisy), (e1_noisy_act,e2_noisy_act,e3_noisy_act) = self.e_noisy(x)
 
         l3_recon = self.g3(e3_noisy_act, e3_noisy)
         u2 = self.d3(l3_recon)
@@ -126,7 +165,7 @@ class LN(nn.Module):
         return sup_noisy, sup_clean, (refs, recs)
 
 
-model = LN()
+model = LN(parallel_encoder=args.parallel_encoder)
 if args.cuda:
     model.cuda()
 
@@ -143,11 +182,22 @@ def ln_loss_function(recons, refs, weights, y_pred, y_true):
     uns = 0
 
     for i, _ in enumerate(recons):
-        mean = refs[i].mean(dim=1).expand(refs[i].size())
-        std = refs[i].std(dim=1).expand(refs[i].size())
-        refs[i] = (refs[i] - mean) / std
-        recons[i] = (recons[i] - mean) / std
-        uns += mse(recons[i], refs[i].detach()) * weights[i]
+        if args.loss_normalization == 'ladder':
+            mean = refs[i].mean(dim=1).expand(refs[i].size())
+            std = refs[i].std(dim=1).expand(refs[i].size())
+            refs[i] = (refs[i] - mean) / std
+            recons[i] = (recons[i] - mean) / std
+        elif args.loss_normalization == 'mean':
+            mean = refs[i].mean(dim=1).expand(refs[i].size())
+            refs[i] = (refs[i] - mean)
+            recons[i] = (recons[i] - mean)
+        elif args.loss_normalization == 'none':
+            pass
+
+        if args.loss_torch_mse:
+            uns += mse(recons[i], refs[i].detach()) * weights[i]
+        else:
+            uns += torch.mean((recons[i] - refs[i])**2) * weights[i]
 
     return sup + uns, sup, uns
 
@@ -161,6 +211,9 @@ def train(epoch):
     model.train()
     train_loss = 0
 
+    import time
+
+    t0 = time.time()
     for batch_idx, (data, label) in enumerate(train_loader):
         data, label = Variable(data), Variable(label)
         if args.cuda:
@@ -176,10 +229,10 @@ def train(epoch):
 
         if batch_idx % args.log_interval == 0:
             from scipy.misc import imsave
-            imsave('refs_0_0.png', refs[0][0].data.numpy().reshape((28,28)))
-            imsave('recs_0_0.png', recs[0][0].data.numpy().reshape((28,28)))
+            imsave('refs_0_0.png', refs[0][0].cpu().data.numpy().reshape((28,28)))
+            imsave('recs_0_0.png', recs[0][0].cpu().data.numpy().reshape((28,28)))
 
-            print('Train Epoch: {epoch} [{bidx:8}/{batches:8} ({bperc:3.0f}%)]\tLoss: {loss:.6f} sup: {sup:.6f} dae: {dae:.6f}'.format(**{
+            print('Train Epoch: {epoch} [{bidx:8}/{batches:8} ({bperc:3.0f}%)]\tLoss: {loss:.6f} sup: {sup:.6f} dae: {dae:.6f} acc: {acc:.2f}'.format(**{
                 'epoch': epoch,
                 'bidx': batch_idx * len(data),
                 'batches': len(train_loader.dataset),
@@ -187,15 +240,20 @@ def train(epoch):
                 'loss': loss.data[0] / len(data),
                 'sup': sl.data[0],
                 'dae': ul.data[0],
+                'acc': y_pred_noisy.data.max(1)[1].eq(label.data).cpu().sum() / len(data),
             }))
+    tt = time.time()
 
-    print('====> Epoch: {} Average loss: {:.4f}'.format(
-          epoch, train_loss / len(train_loader.dataset)))
+    print('====> Epoch: {} Average loss: {:.4f} Time: {:.2}s'.format(
+          epoch, train_loss / len(train_loader.dataset), tt-t0))
 
 def validate(epoch):
     model.eval()
 
     total_loss = 0
+    correct = 0
+    n = 0
+
     for batch_idx, (data, label) in enumerate(val_loader):
         data, label = Variable(data), Variable(label)
         if args.cuda:
@@ -206,8 +264,17 @@ def validate(epoch):
         val_loss, *_ = ln_loss_function(recs, refs, dae_weights, y_pred_clean, label)
         total_loss += val_loss.data[0]
 
+        pred = y_pred_clean.data.max(1)[1] # get the index of the max log-probability
+        correct += pred.eq(label.data).cpu().sum()
+        n += data.size(0)
+
     total_loss /= float(len(val_loader) * args.batch_size)
-    print('====> Validation set loss: {:.4f}'.format(total_loss))
+    print('====> Validation set loss: {total_loss:.4f}, Acc.: {acc:.2f}/{n} ({accperc:.2f})'.format(**{
+        'total_loss':total_loss,
+        'acc': correct,
+        'n': n,
+        'accperc': correct / n,
+    }))
 
 def test(epoch):
     model.eval()
