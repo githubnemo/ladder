@@ -7,6 +7,8 @@ import torch.optim as optim
 from torch.autograd import Variable
 from torchvision import datasets, transforms
 
+from logger import Logger
+
 parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
 parser.add_argument('--batch-size', type=int, default=128, metavar='N',
                     help='input batch size for training (default: 64)')
@@ -206,6 +208,7 @@ optimizer = optim.Adam(model.parameters(), lr=0.002)
 
 dae_weights = [1000, 10, 0.1, 0.1]
 
+logger = Logger('./logs')
 
 def train(epoch):
     model.train()
@@ -228,9 +231,20 @@ def train(epoch):
         optimizer.step()
 
         if batch_idx % args.log_interval == 0:
-            from scipy.misc import imsave
-            imsave('refs_0_0.png', refs[0][0].cpu().data.numpy().reshape((28,28)))
-            imsave('recs_0_0.png', recs[0][0].cpu().data.numpy().reshape((28,28)))
+            #from scipy.misc import imsave
+            #imsave('refs_0_0.png', refs[0][0].cpu().data.numpy().reshape((28,28)))
+            #imsave('recs_0_0.png', recs[0][0].cpu().data.numpy().reshape((28,28)))
+
+            step = (epoch-1) * len(train_loader) + batch_idx
+            logger.scalar_summary('loss', loss.data[0], step)
+
+            logger.image_summary('recs', recs[0][0].cpu().view(-1,28,28).data.numpy(), step)
+
+            def to_np(x): return x.data.cpu().numpy()
+            for tag, value in model.named_parameters():
+                tag = tag.replace('.', '/')
+                logger.histo_summary(tag, to_np(value), step+1)
+                logger.histo_summary(tag+'/grad', to_np(value.grad), step+1)
 
             print('Train Epoch: {epoch} [{bidx:8}/{batches:8} ({bperc:3.0f}%)]\tLoss: {loss:.6f} sup: {sup:.6f} dae: {dae:.6f} acc: {acc:.2f}'.format(**{
                 'epoch': epoch,
