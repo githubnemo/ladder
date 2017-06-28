@@ -3,53 +3,9 @@ import argparse
 import torch
 import torch.utils.data
 import torch.nn as nn
-import torch.optim as optim
 from torch.autograd import Variable
-from torchvision import datasets, transforms
-
-from logger import Logger
-
-parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
-parser.add_argument('--batch-size', type=int, default=128, metavar='N',
-                    help='input batch size for training (default: 64)')
-parser.add_argument('--train-samples', type=int, default=50000)
-parser.add_argument('--validation-samples', type=int, default=10000)
-parser.add_argument('--noise-sigma', type=float, default=0.3)
-parser.add_argument('--epochs', type=int, default=10, metavar='N',
-                    help='number of epochs to train (default: 2)')
-parser.add_argument('--no-cuda', action='store_true', default=False,
-                    help='enables CUDA training')
-parser.add_argument('--loss-torch-mse', action='store_true',
-                    help='use torch builtin MSE for recon loss instead of manual comp. to avoid need for detach')
-parser.add_argument('--loss-normalization', type=str, choices=['ladder','mean','none'], default='ladder')
-parser.add_argument('--seed', type=int, default=1, metavar='S',
-                    help='random seed (default: 1)')
-parser.add_argument('--parallel-encoder', action='store_true',
-                    help='Execute noisy and clean encoder in parallel (default: off)')
-parser.add_argument('--log-interval', type=int, default=10, metavar='N',
-                    help='how many batches to wait before logging training status')
-args = parser.parse_args()
-args.cuda = not args.no_cuda and torch.cuda.is_available()
 
 
-torch.manual_seed(args.seed)
-if args.cuda:
-    torch.cuda.manual_seed(args.seed)
-
-
-kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
-train_loader = torch.utils.data.DataLoader(
-    datasets.MNIST('../data', train=True, download=True,
-                   transform=transforms.ToTensor()),
-    sampler=torch.utils.data.sampler.SubsetRandomSampler(list(range(0,args.train_samples))),
-    batch_size=args.batch_size, shuffle=True, **kwargs)
-val_loader = torch.utils.data.DataLoader(
-    datasets.MNIST('../data', train=True, transform=transforms.ToTensor()),
-    batch_size=args.batch_size, shuffle=False,
-    sampler=torch.utils.data.sampler.SubsetRandomSampler(list(range(args.train_samples,args.train_samples+args.validation_samples))), **kwargs)
-test_loader = torch.utils.data.DataLoader(
-    datasets.MNIST('../data', train=False, transform=transforms.ToTensor()),
-    batch_size=args.batch_size, shuffle=True, **kwargs)
 
 class LinearCombinator(nn.Module):
     def __init__(self, input_shape):
@@ -77,15 +33,16 @@ class MLPCombinator(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, layers, acts, noise_std=0.):
+    def __init__(self, layers, acts, cuda, noise_std=0.):
         super().__init__()
+        self.cuda = cuda
         self.acts = acts
         self.layers = layers
         self.noise_std = noise_std
 
     def noise(self, x):
         noise = Variable(torch.randn(x.size()) * self.noise_std)
-        if args.cuda:
+        if self.cuda:
             noise = noise.cuda()
         return x + noise
 
@@ -113,7 +70,7 @@ class Encoder(nn.Module):
         return pres, acts
 
 class LN(nn.Module):
-    def __init__(self, parallel_encoder=False):
+    def __init__(self, parallel_encoder=False, noise_std=0.3, cuda=False):
         super(LN, self).__init__()
 
         self.parallel_encoder = parallel_encoder
@@ -137,8 +94,8 @@ class LN(nn.Module):
         acts = [self.relu, self.relu, self.softmax]
         layers = [self.e1, self.e2, self.e3]
 
-        self.e_noisy = Encoder(layers=layers, acts=acts, noise_std=args.noise_sigma)
-        self.e_clean = Encoder(layers=layers, acts=acts, noise_std=0.0)
+        self.e_noisy = Encoder(layers=layers, acts=acts, cuda=cuda, noise_std=noise_std)
+        self.e_clean = Encoder(layers=layers, acts=acts, cuda=cuda, noise_std=0.0)
 
         if self.parallel_encoder:
             self.e_noisy = torch.nn.DataParallel(self.e_noisy, device_ids=[0])
@@ -167,141 +124,164 @@ class LN(nn.Module):
         return sup_noisy, sup_clean, (refs, recs)
 
 
-model = LN(parallel_encoder=args.parallel_encoder)
-if args.cuda:
-    model.cuda()
+    """
 
-reconstruction_function = nn.BCELoss()
-reconstruction_function.size_average = False
+          |   e3_rc
+          o---------o
+          |   e3_sc |   u3
+         (f)   .-->(g)  g3
+          o----'    |
+    e3  [ooo]     [ooo] d3
+          |         |   u2
+         (f)   .-->(g)  g2
+          o----'    |
+    e2  [ooo]     [ooo] d2
+          |         |   u1
+         (f)   .-->(g)  g1
+          o----'    |
+    e1  [ooo]     [ooo] d1
+          |         |   u0
+          o------->(g)  g0
+          |         |
+    e0  [ooo]     [ooo]
+
+    """
+    def sample_k(self, z, k=1):
+        e3_rc = z
+        e3_sc = self.e_noisy.noise(z)
+
+        for _ in range(k):
+            g3 = self.g3(e3_rc, e3_sc)
+            u2 = self.d3(g3)
+            e3_sc = self.e_noisy.noise(self.e3(u2))
+
+        e2_rc = u2
+        e2_sc = self.e_noisy.noise(u2)
+
+        for _ in range(k):
+            g2 = self.g2(e2_rc, e2_sc)
+            u1 = self.d2(g2)
+            e2_sc = self.e_noisy.noise(self.e2(u1))
+
+        e1_rc = u1
+        e1_sc = self.e_noisy.noise(u1)
+
+        for _ in range(k):
+            g1 = self.g1(e1_rc, e1_sc)
+            u0 = self.d1(g1)
+            e1_sc = self.e_noisy.noise(self.e1(u0))
+
+        e0_rc = u0
+        e0_sc = self.e_noisy.noise(u0)
+
+        g0 = self.g0(e0_rc, e0_sc)
+
+        return g0
+
+    def sample_s(self, z, j=1, k=None):
+        x = self.d1(self.d2(self.d3(z)))
+
+        for _ in range(j):
+            (e0_noisy,e1_noisy,e2_noisy,_), (e1_noisy_act,e2_noisy_act,_) = self.e_clean(x)
+
+            l3_recon = z
+            u2 = self.d3(l3_recon)
+            l2_recon = self.g2(u2, e2_noisy)
+            u1 = self.d2(l2_recon)
+            l1_recon = self.g1(u1, e1_noisy)
+            u0 = self.d1(l1_recon)
+            l0_recon = self.g0(u0, e0_noisy)
+
+            x = l0_recon
+
+            mean = x.mean(dim=1).expand(x.size())
+            std = x.std(dim=1).expand(x.size())
+            x = (x)/std
+        return x
+
+    def sample_j(self, z, j=1, k=1):
+        for _ in range(j):
+            x = self.sample_k(z, k)
+            (e0_clean,e1_clean,e2_clean,e3_clean), (e1_clean_act,e2_clean_act,e3_clean_act) = self.e_clean(x)
+            z = e3_clean_act
+        return x
+
+    def sample_ble(self, z, k=1, j=1):
+        x = self.d1(self.d2(self.d3(z)))
+
+        (e0_noisy,e1_noisy,e2_noisy,e3_noisy), (e1_noisy_act,e2_noisy_act,e3_noisy_act) = self.e_noisy(x)
+
+        for _ in range(j):
+            u2 = self.d3(z)
+
+            for _ in range(k):
+                l2_recon = self.g2(u2, e2_noisy)
+                u1 = self.d2(l2_recon)
+                e2_noisy, _ = self.e_noisy.encode(self.e2, self.relu, u1)
+
+            for _ in range(k):
+                l2_recon = self.g2(u2, e2_noisy)
+                u1 = self.d2(l2_recon)
+                l1_recon = self.g1(u1, e1_noisy)
+                u0 = self.d1(l1_recon)
+                e1_noisy, _ = self.e_noisy.encode(self.e1, self.relu, u0)
+                e2_noisy, _ = self.e_noisy.encode(self.e2, self.relu, e1_noisy)
+
+            for _ in range(k):
+                l2_recon = self.g2(u2, e2_noisy)
+                u1 = self.d2(l2_recon)
+                l1_recon = self.g1(u1, e1_noisy)
+                u0 = self.d1(l1_recon)
+                l0_recon = self.g0(u0, e0_noisy)
+                e0_noisy = l0_recon
+                e1_noisy, _ = self.e_noisy.encode(self.e1, self.relu, e0_noisy)
+                e2_noisy, _ = self.e_noisy.encode(self.e2, self.relu, e1_noisy)
+
+            x = l0_recon
+            continue
 
 
-nll = nn.NLLLoss()
-mse = nn.MSELoss()
+            l3_recon = z
+            u2 = self.d3(l3_recon)
+            l2_recon = self.g2(u2, e2_noisy)
+            u1 = self.d2(l2_recon)
+            l1_recon = self.g1(u1, e1_noisy)
+            u0 = self.d1(l1_recon)
+            l0_recon = self.g0(u0, e0_noisy)
+
+            x = l0_recon
+
+        return x
+
+    def sample(self, z, k=1):
+        z_noisy_1 = self.e_noisy.noise(z)
+        z_noisy_2 = self.e_noisy.noise(z)
+
+        for _ in range(k):
+            l3_recon = self.g3(z_noisy_1, z_noisy_2)
+            z_noisy_2 = l3_recon
 
 
-def ln_loss_function(recons, refs, weights, y_pred, y_true):
-    sup = nll(y_pred, y_true)
-    uns = 0
+        u2_1 = self.d3(l3_recon)
+        u2_2 = self.e_noisy.noise(u2_1)
 
-    for i, _ in enumerate(recons):
-        if args.loss_normalization == 'ladder':
-            mean = refs[i].mean(dim=1).expand(refs[i].size())
-            std = refs[i].std(dim=1).expand(refs[i].size())
-            refs[i] = (refs[i] - mean) / std
-            recons[i] = (recons[i] - mean) / std
-        elif args.loss_normalization == 'mean':
-            mean = refs[i].mean(dim=1).expand(refs[i].size())
-            refs[i] = (refs[i] - mean)
-            recons[i] = (recons[i] - mean)
-        elif args.loss_normalization == 'none':
-            pass
+        for _ in range(k):
+            l2_recon = self.g2(u2_1, u2_2)
+            u2_2 = self.e_noisy.noise(l2_recon)
 
-        if args.loss_torch_mse:
-            uns += mse(recons[i], refs[i].detach()) * weights[i]
-        else:
-            uns += torch.mean((recons[i] - refs[i])**2) * weights[i]
+        u1_1 = self.d2(l2_recon)
+        u1_2 = self.e_noisy.noise(u1_1)
 
-    return sup + uns, sup, uns
+        for _ in range(k):
+            l1_recon = self.g1(u1_1, u1_2)
+            u1_2 = self.e_noisy.noise(l1_recon)
 
+        u0_1 = self.d1(l1_recon)
+        u0_2 = self.e_noisy.noise(u0_1)
 
-optimizer = optim.Adam(model.parameters(), lr=0.002)
+        for _ in range(k):
+            l0_recon = self.g0(u0_1, u0_2)
+            u0_2 = self.e_noisy.noise(l0_recon)
 
-dae_weights = [1000, 10, 0.1, 0.1]
+        return l0_recon
 
-logger = Logger('./logs')
-
-def train(epoch):
-    model.train()
-    train_loss = 0
-
-    import time
-
-    t0 = time.time()
-    for batch_idx, (data, label) in enumerate(train_loader):
-        data, label = Variable(data), Variable(label)
-        if args.cuda:
-            data = data.cuda()
-            label = label.cuda()
-        optimizer.zero_grad()
-
-        y_pred_noisy,  y_pred_clean, (refs, recs) = model(data)
-        loss, sl, ul = ln_loss_function(recs, refs, dae_weights, y_pred_noisy, label)
-        loss.backward()
-        train_loss += loss.data[0]
-        optimizer.step()
-
-        if batch_idx % args.log_interval == 0:
-            #from scipy.misc import imsave
-            #imsave('refs_0_0.png', refs[0][0].cpu().data.numpy().reshape((28,28)))
-            #imsave('recs_0_0.png', recs[0][0].cpu().data.numpy().reshape((28,28)))
-
-            step = (epoch-1) * len(train_loader) + batch_idx
-            logger.scalar_summary('loss', loss.data[0], step)
-
-            logger.image_summary('recs', recs[0][0].cpu().view(-1,28,28).data.numpy(), step)
-
-            def to_np(x): return x.data.cpu().numpy()
-            for tag, value in model.named_parameters():
-                tag = tag.replace('.', '/')
-                logger.histo_summary(tag, to_np(value), step+1)
-                logger.histo_summary(tag+'/grad', to_np(value.grad), step+1)
-
-            print('Train Epoch: {epoch} [{bidx:8}/{batches:8} ({bperc:3.0f}%)]\tLoss: {loss:.6f} sup: {sup:.6f} dae: {dae:.6f} acc: {acc:.2f}'.format(**{
-                'epoch': epoch,
-                'bidx': batch_idx * len(data),
-                'batches': len(train_loader.dataset),
-                'bperc': 100. * batch_idx / len(train_loader),
-                'loss': loss.data[0] / len(data),
-                'sup': sl.data[0],
-                'dae': ul.data[0],
-                'acc': y_pred_noisy.data.max(1)[1].eq(label.data).cpu().sum() / len(data),
-            }))
-    tt = time.time()
-
-    print('====> Epoch: {} Average loss: {:.4f} Time: {:.2}s'.format(
-          epoch, train_loss / len(train_loader.dataset), tt-t0))
-
-def validate(epoch):
-    model.eval()
-
-    total_loss = 0
-    correct = 0
-    n = 0
-
-    for batch_idx, (data, label) in enumerate(val_loader):
-        data, label = Variable(data), Variable(label)
-        if args.cuda:
-            data = data.cuda()
-            label = label.cuda()
-        y_pred_noisy, y_pred_clean, (refs, recs) = model(data)
-
-        val_loss, *_ = ln_loss_function(recs, refs, dae_weights, y_pred_clean, label)
-        total_loss += val_loss.data[0]
-
-        pred = y_pred_clean.data.max(1)[1] # get the index of the max log-probability
-        correct += pred.eq(label.data).cpu().sum()
-        n += data.size(0)
-
-    total_loss /= float(len(val_loader) * args.batch_size)
-    print('====> Validation set loss: {total_loss:.4f}, Acc.: {acc:.2f}/{n} ({accperc:.2f})'.format(**{
-        'total_loss':total_loss,
-        'acc': correct,
-        'n': n,
-        'accperc': correct / n,
-    }))
-
-def test(epoch):
-    model.eval()
-    test_loss = 0
-    for data, _ in test_loader:
-        data = Variable(data, volatile=True)
-        recon_batch = model(data)
-        test_loss += ln_loss_function(recon_batch, data).data[0]
-
-    test_loss /= len(test_loader.dataset)
-    print('====> Test set loss: {:.4f}'.format(test_loss))
-
-for epoch in range(1, args.epochs + 1):
-    train(epoch)
-    validate(epoch)
-    #test(epoch)

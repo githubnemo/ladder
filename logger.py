@@ -12,8 +12,8 @@ class Logger(object):
 
     def __init__(self, log_dir):
         """Create a summary writer logging to log_dir."""
-        run = self._run_id(log_dir)
-        self.writer = tf.summary.FileWriter(os.path.join(log_dir, run))
+        self.run_path = os.path.join(log_dir, self._run_id(log_dir))
+        self.writer = tf.summary.FileWriter(self.run_path)
 
     def _run_id(self, log_dir):
         entries = [0] + [int(n[len('run_'):]) for n in os.listdir(log_dir) if n[len('run_'):].isnumeric()]
