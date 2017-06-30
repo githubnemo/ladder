@@ -32,6 +32,7 @@ parser.add_argument('--parallel-encoder', action='store_true',
 parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                     help='how many batches to wait before logging training status')
 parser.add_argument('checkpoint', type=argparse.FileType('r'))
+parser.add_argument('prefix', type=str, default='', help='prefix for the output files')
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 
@@ -60,6 +61,8 @@ model = torch.load(args.checkpoint.name)
 if args.cuda:
     model.cuda()
 
+model.eval()
+
 logger = Logger('./logs')
 
 
@@ -69,7 +72,7 @@ z.data[0][args.cls] = 1
 if args.cuda:
     z = z.cuda()
 
-model.e_noisy.noise_std = args.noise_sigma
+model.noise_std = args.noise_sigma
 #sample = model.sample_j(z, args.samples_k, args.samples_j)
 #sample = model.sample_ble(z, k=args.samples_k, j=args.samples_j)
 #sample = model.sample_s(z, k=args.samples_k, j=args.samples_j)
@@ -93,10 +96,21 @@ print(example)
 
 samples = model.sample_by_example(example, k=args.samples_k)
 
-imsave('example_sample_example.png', example.cpu().data.numpy().reshape(28,28))
+if args.prefix:
+    prefix = '{}_example_sample'.format(args.prefix)
+else:
+    prefix = 'example_sample'
+
+
+directory = os.path.dirname(prefix)
+
+if directory:
+    os.system('mkdir -p {}'.format(directory))
+
+
+imsave('{}_example.png'.format(prefix), example.cpu().data.numpy().reshape(28,28))
 
 for i, sample in enumerate(samples):
     sample = sample.clamp(min=-255, max=255)
-    imsave('example_sample_{}.png'.format(i+1), sample.cpu().data.numpy().reshape((28,28)))
-
+    imsave('{}_{}.png'.format(prefix,i+1), sample.cpu().data.numpy().reshape((28,28)))
 

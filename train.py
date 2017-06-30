@@ -26,13 +26,12 @@ parser.add_argument('--loss-torch-mse', action='store_true',
 parser.add_argument('--loss-normalization', type=str, choices=['ladder','mean','none'], default='ladder')
 parser.add_argument('--seed', type=int, default=1, metavar='S',
                     help='random seed (default: 1)')
-parser.add_argument('--parallel-encoder', action='store_true',
-                    help='Execute noisy and clean encoder in parallel (default: off)')
 parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                     help='how many batches to wait before logging training status')
+parser.add_argument('--batchnorm', choices=['off','decoder','encoder','all'])
+
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
-
 
 torch.manual_seed(args.seed)
 if args.cuda:
@@ -54,7 +53,7 @@ test_loader = torch.utils.data.DataLoader(
     batch_size=args.batch_size, shuffle=True, **kwargs)
 
 
-model = LN(parallel_encoder=args.parallel_encoder, cuda=args.cuda, noise_std=args.noise_sigma)
+model = LN(batchnorm_mode=args.batchnorm, cuda=args.cuda, noise_std=args.noise_sigma)
 if args.cuda:
     model.cuda()
 
