@@ -133,7 +133,7 @@ class LN(nn.Module):
         return (x - mean) / std
 
 
-    def decode(self, layer, g, recon, shortcut, e_stats=(0,1)):
+    def decode(self, layer, g, recon, shortcut, z_norm=(0,1)):
         if not layer: # top most g has no predecessor layer
             u = recon
         else:
@@ -141,7 +141,7 @@ class LN(nn.Module):
         u = self.bnorm(u) if ('decoder' in self.batchnorm_mode) else u
         z = g(u, shortcut)
 
-        z_mu, z_std = e_stats
+        z_mu, z_std = z_norm
         z = (z - z_mu) / z_std
 
         return z
