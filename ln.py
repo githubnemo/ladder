@@ -146,45 +146,13 @@ class LN(nn.Module):
     e0  [ooo]     [ooo]
 
     """
-    def sample_k(self, z, k=1):
-        e3_rc = z
-        e3_sc = self.e_noisy.noise(z)
+
+    def sample_by_example(self, x, k=1):
+        samples = []
 
         for _ in range(k):
-            g3 = self.g3(e3_rc, e3_sc)
-            u2 = self.d3(g3)
-            e3_sc = self.e_noisy.noise(self.e3(u2))
-
-        e2_rc = u2
-        e2_sc = self.e_noisy.noise(u2)
-
-        for _ in range(k):
-            g2 = self.g2(e2_rc, e2_sc)
-            u1 = self.d2(g2)
-            e2_sc = self.e_noisy.noise(self.e2(u1))
-
-        e1_rc = u1
-        e1_sc = self.e_noisy.noise(u1)
-
-        for _ in range(k):
-            g1 = self.g1(e1_rc, e1_sc)
-            u0 = self.d1(g1)
-            e1_sc = self.e_noisy.noise(self.e1(u0))
-
-        e0_rc = u0
-        e0_sc = self.e_noisy.noise(u0)
-
-        g0 = self.g0(e0_rc, e0_sc)
-
-        return g0
-
-    def sample_s(self, z, j=1, k=None):
-        x = self.d1(self.d2(self.d3(z)))
-
-        for _ in range(j):
-            (e0_noisy,e1_noisy,e2_noisy,_), (e1_noisy_act,e2_noisy_act,_) = self.e_clean(x)
-
-            l3_recon = z
+            (e0_noisy,e1_noisy,e2_noisy,e3_noisy), (e1_noisy_act,e2_noisy_act,e3_noisy_act) = self.e_noisy(x)
+            l3_recon = self.g3(e3_noisy_act, e3_noisy)
             u2 = self.d3(l3_recon)
             l2_recon = self.g2(u2, e2_noisy)
             u1 = self.d2(l2_recon)
@@ -194,94 +162,24 @@ class LN(nn.Module):
 
             x = l0_recon
 
-            mean = x.mean(dim=1).expand(x.size())
-            std = x.std(dim=1).expand(x.size())
-            x = (x)/std
-        return x
+            samples.append(x)
 
-    def sample_j(self, z, j=1, k=1):
-        for _ in range(j):
-            x = self.sample_k(z, k)
-            (e0_clean,e1_clean,e2_clean,e3_clean), (e1_clean_act,e2_clean_act,e3_clean_act) = self.e_clean(x)
-            z = e3_clean_act
-        return x
+        return samples
 
-    def sample_ble(self, z, k=1, j=1):
-        x = self.d1(self.d2(self.d3(z)))
-
-        (e0_noisy,e1_noisy,e2_noisy,e3_noisy), (e1_noisy_act,e2_noisy_act,e3_noisy_act) = self.e_noisy(x)
-
-        for _ in range(j):
-            u2 = self.d3(z)
-
-            for _ in range(k):
-                l2_recon = self.g2(u2, e2_noisy)
-                u1 = self.d2(l2_recon)
-                e2_noisy, _ = self.e_noisy.encode(self.e2, self.relu, u1)
-
-            for _ in range(k):
-                l2_recon = self.g2(u2, e2_noisy)
-                u1 = self.d2(l2_recon)
-                l1_recon = self.g1(u1, e1_noisy)
-                u0 = self.d1(l1_recon)
-                e1_noisy, _ = self.e_noisy.encode(self.e1, self.relu, u0)
-                e2_noisy, _ = self.e_noisy.encode(self.e2, self.relu, e1_noisy)
-
-            for _ in range(k):
-                l2_recon = self.g2(u2, e2_noisy)
-                u1 = self.d2(l2_recon)
-                l1_recon = self.g1(u1, e1_noisy)
-                u0 = self.d1(l1_recon)
-                l0_recon = self.g0(u0, e0_noisy)
-                e0_noisy = l0_recon
-                e1_noisy, _ = self.e_noisy.encode(self.e1, self.relu, e0_noisy)
-                e2_noisy, _ = self.e_noisy.encode(self.e2, self.relu, e1_noisy)
-
-            x = l0_recon
-            continue
-
-
-            l3_recon = z
-            u2 = self.d3(l3_recon)
-            l2_recon = self.g2(u2, e2_noisy)
-            u1 = self.d2(l2_recon)
-            l1_recon = self.g1(u1, e1_noisy)
-            u0 = self.d1(l1_recon)
-            l0_recon = self.g0(u0, e0_noisy)
-
-            x = l0_recon
-
-        return x
 
     def sample(self, z, k=1):
-        z_noisy_1 = self.e_noisy.noise(z)
-        z_noisy_2 = self.e_noisy.noise(z)
+        """
+        - we sample from \hat{P}(z) several times before using the reconstruction
+        - we do this by repeatedly using the reconstruction as input
 
-        for _ in range(k):
-            l3_recon = self.g3(z_noisy_1, z_noisy_2)
-            z_noisy_2 = l3_recon
+        References:
+        - Improving Sampling from Generative Autoencoders with Markov Chains
+        """
+        e3_rc = e3_sc = z
 
+        g3 = self.g3(e3_rc, e3_sc)
+        u2 = self.d3(g3)
+        #e3_sc = self.e3(self.relu(u2))
 
-        u2_1 = self.d3(l3_recon)
-        u2_2 = self.e_noisy.noise(u2_1)
-
-        for _ in range(k):
-            l2_recon = self.g2(u2_1, u2_2)
-            u2_2 = self.e_noisy.noise(l2_recon)
-
-        u1_1 = self.d2(l2_recon)
-        u1_2 = self.e_noisy.noise(u1_1)
-
-        for _ in range(k):
-            l1_recon = self.g1(u1_1, u1_2)
-            u1_2 = self.e_noisy.noise(l1_recon)
-
-        u0_1 = self.d1(l1_recon)
-        u0_2 = self.e_noisy.noise(u0_1)
-
-        for _ in range(k):
-            l0_recon = self.g0(u0_1, u0_2)
-            u0_2 = self.e_noisy.noise(l0_recon)
-
-        return l0_recon
+        # TODO
 
