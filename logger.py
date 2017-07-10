@@ -10,9 +10,16 @@ import os
 
 class Logger(object):
 
-    def __init__(self, log_dir):
-        """Create a summary writer logging to log_dir."""
-        self.run_path = os.path.join(log_dir, self._run_id(log_dir))
+    def __init__(self, log_dir, running_naming=True):
+        """
+        Create a summary writer logging to log_dir. Chooses its own 
+        directory (log_dir/run_(n+1)) or, if disabled (running_naming=False), 
+        just writes the result to log_dir.
+        """
+        if running_naming:
+            self.run_path = os.path.join(log_dir, self._run_id(log_dir))
+        else:
+            self.run_path = log_dir
         self.writer = tf.summary.FileWriter(self.run_path)
 
     def _run_id(self, log_dir):
