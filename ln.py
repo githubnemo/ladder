@@ -21,15 +21,43 @@ class MLPCombinator(nn.Module):
     def __init__(self, input_shape):
         super(MLPCombinator, self).__init__()
 
-        self.l1 = nn.Linear(3*input_shape, input_shape)
-        self.l2 = nn.Linear(4*input_shape, input_shape)
+        self.a1 = nn.Parameter(torch.Tensor(input_shape))
+        self.a2 = nn.Parameter(torch.Tensor(input_shape))
+        self.a3 = nn.Parameter(torch.Tensor(input_shape))
+        self.a4 = nn.Parameter(torch.Tensor(input_shape))
+        self.a5 = nn.Parameter(torch.Tensor(input_shape))
+        self.b1 = nn.Parameter(torch.Tensor(input_shape))
+        self.b2 = nn.Parameter(torch.Tensor(input_shape))
+        self.b3 = nn.Parameter(torch.Tensor(input_shape))
+        self.b4 = nn.Parameter(torch.Tensor(input_shape))
+
+        self.a1.data.zero_()
+        self.a2.data.zero_().add_(1)
+        self.a3.data.zero_()
+        self.a4.data.zero_().add_(1)
+        self.a5.data.zero_()
+        self.b1.data.zero_()
+        self.b2.data.zero_().add_(1)
+        self.b3.data.zero_()
+        self.b4.data.zero_()
 
         self.sig = nn.Sigmoid()
 
-    def forward(self, u, z):
-        x = torch.cat((u, z, u*z), dim=1)
-        s = self.sig(self.l1(x))
-        return self.l2(torch.cat((x,s), dim=1))
+    def forward(self, u, z_lat):
+        a1 = self.a1.expand(u.size())
+        a2 = self.a2.expand(u.size())
+        a3 = self.a3.expand(u.size())
+        a4 = self.a4.expand(u.size())
+        a5 = self.a5.expand(u.size())
+        b1 = self.b1.expand(u.size())
+        b2 = self.b2.expand(u.size())
+        b3 = self.b3.expand(u.size())
+        b4 = self.b4.expand(u.size())
+
+        s = self.sig(b1 * u + b2 * z_lat + b3 * u * z_lat + b4)
+        return a1 * u + a2 * z_lat + a3 * u * z_lat + a4 * s + a5
+
+
 
 
 class TwoStepBatchNorm(nn.Module):
@@ -105,11 +133,12 @@ class LN(nn.Module):
         self.e2 = nn.Linear(300, 20)
         self.e3 = nn.Linear(20, 10)
 
-        self.d3 = nn.Linear(10, 20)
-        self.d2 = nn.Linear(20, 300)
-        self.d1 = nn.Linear(300, 784)
+        self.d3 = nn.Linear(10, 20, bias=False)
+        self.d2 = nn.Linear(20, 300, bias=False)
+        self.d1 = nn.Linear(300, 784, bias=False)
 
         sizes = [300, 20, 10]
+        decsizes = [20, 300, 784]
 
         self.g3 = MLPCombinator(10)
         self.g2 = MLPCombinator(20)
@@ -119,12 +148,20 @@ class LN(nn.Module):
         self.acts = [self.relu, self.relu, self.softmax]
         self.layers = [self.e1, self.e2, self.e3]
         self.bnorms = [None] * len(self.layers)
+        self.decoders = [self.d3, self.d2, self.d1]
+        self.decbnorms = [None] * len(self.decoders)
 
         if 'encoder' in self.batchnorm_mode:
             for i in range(len(self.layers)):
                 self.bnorms[i] = TwoStepBatchNorm(sizes[i])
                 if self.cuda: 
                     self.bnorms[i].cuda()
+
+        if 'decoder' in self.batchnorm_mode:
+            for i in range(len(self.decoders)):
+                self.decbnorms[i] = nn.BatchNorm1d(decsizes[i], affine=False)
+                if self.cuda:
+                    self.decbnorms[i].cuda()
 
 
     def bnorm(self, x):
@@ -133,18 +170,18 @@ class LN(nn.Module):
         return (x - mean) / std
 
 
-    def decode(self, layer, g, recon, shortcut, z_norm=(0,1)):
+    def decode(self, layer, bnorm, g, recon, shortcut, z_norm=(0,1)):
         if not layer: # top most g has no predecessor layer
             u = recon
         else:
             u = layer(recon)
-        u = self.bnorm(u) if ('decoder' in self.batchnorm_mode) else u
+        u = bnorm(u) if (bnorm and 'decoder' in self.batchnorm_mode) else u
         z = g(u, shortcut)
 
         z_mu, z_std = z_norm
-        z = (z - z_mu) / z_std
+        z_bn = (z - z_mu) / z_std
 
-        return z
+        return z, z_bn
 
 
     def noise(self, x, noise_std):
@@ -196,13 +233,14 @@ class LN(nn.Module):
         e_clean_stat, e_clean, e_clean_act = self.encode_all(x)
         e_noisy_stat, e_noisy, e_noisy_act = self.encode_all(x, self.noise_std)
 
-        l3_recon = self.decode(None,    self.g3, e_noisy_act[-1], e_noisy[3], e_clean_stat[3])
-        l2_recon = self.decode(self.d3, self.g2, l3_recon, e_noisy[2], e_clean_stat[2])
-        l1_recon = self.decode(self.d2, self.g1, l2_recon, e_noisy[1], e_clean_stat[1])
-        l0_recon = self.decode(self.d1, self.g0, l1_recon, e_noisy[0], e_clean_stat[0])
+        dbnorms = self.decbnorms
+        l3_recon, l3_recon_bn = self.decode(None,          None, self.g3, e_noisy_act[-1], e_noisy[3], e_clean_stat[3])
+        l2_recon, l2_recon_bn = self.decode(self.d3, dbnorms[0], self.g2, l3_recon, e_noisy[2], e_clean_stat[2])
+        l1_recon, l1_recon_bn = self.decode(self.d2, dbnorms[1], self.g1, l2_recon, e_noisy[1], e_clean_stat[1])
+        l0_recon, l0_recon_bn = self.decode(self.d1, dbnorms[2], self.g0, l1_recon, e_noisy[0], e_clean_stat[0])
 
         refs = e_clean
-        recs = [l0_recon, l1_recon, l2_recon, l3_recon]
+        recs = [l0_recon_bn, l1_recon_bn, l2_recon_bn, l3_recon_bn]
         sup_noisy = e_noisy_act[-1]
         sup_clean = e_clean_act[-1]
 
@@ -210,7 +248,7 @@ class LN(nn.Module):
 
 
     """
-
+          y
           |   e3_rc
           o---------o
           |   e3_sc |   u3
@@ -232,18 +270,23 @@ class LN(nn.Module):
 
     """
 
-    def sample_by_example(self, x, k=1):
+    def sample_by_example(self, x, k=1, use_bn=True):
         samples = []
-
-        stat = [(0,1)] * 4
+        dbnorms = self.decbnorms
 
         for _ in range(k):
             e_noisy_stat, e_noisy, e_noisy_act = self.encode_all(x, self.noise_std)
-    
-            l3_recon = self.decode(None,    self.g3, e_noisy_act[-1], e_noisy[3], e_noisy_stat[3])
-            l2_recon = self.decode(self.d3, self.g2, l3_recon, e_noisy[2], e_noisy_stat[2])
-            l1_recon = self.decode(self.d2, self.g1, l2_recon, e_noisy[1], e_noisy_stat[1])
-            l0_recon = self.decode(self.d1, self.g0, l1_recon, e_noisy[0], e_noisy_stat[0])
+
+            if use_bn:
+                _, l3_recon = self.decode(None,          None, self.g3, e_noisy_act[-1], e_noisy[3], e_noisy_stat[3])
+                _, l2_recon = self.decode(self.d3, dbnorms[0], self.g2, l3_recon, e_noisy[2], e_noisy_stat[2])
+                _, l1_recon = self.decode(self.d2, dbnorms[1], self.g1, l2_recon, e_noisy[1], e_noisy_stat[1])
+                _, l0_recon = self.decode(self.d1, dbnorms[2], self.g0, l1_recon, e_noisy[0], e_noisy_stat[0])
+            else:
+                l3_recon, _ = self.decode(None,          None, self.g3, e_noisy_act[-1], e_noisy[3], e_noisy_stat[3])
+                l2_recon, _ = self.decode(self.d3, dbnorms[0], self.g2, l3_recon, e_noisy[2], e_noisy_stat[2])
+                l1_recon, _ = self.decode(self.d2, dbnorms[1], self.g1, l2_recon, e_noisy[1], e_noisy_stat[1])
+                l0_recon, _ = self.decode(self.d1, dbnorms[2], self.g0, l1_recon, e_noisy[0], e_noisy_stat[0])
             
             x = l0_recon
 
