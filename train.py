@@ -9,6 +9,7 @@ from torchvision import datasets, transforms
 import os
 
 from logger import Logger
+from dotter import make_dot
 from ln import LN
 
 parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
@@ -29,6 +30,7 @@ parser.add_argument('--seed', type=int, default=1, metavar='S',
 parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                     help='how many batches to wait before logging training status')
 parser.add_argument('--batchnorm', choices=['off','decoder','encoder','all'], default='off')
+parser.add_argument('--name', default='', type=str)
 
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
@@ -91,7 +93,8 @@ optimizer = optim.Adam(model.parameters(), lr=0.002)
 
 dae_weights = [1000, 10, 0.1, 0.1]
 
-logger = Logger('./logs')
+log_path = os.path.join('logs', args.name)
+logger = Logger(log_path, running_naming=not args.name)
 
 def train(epoch):
     model.train()
@@ -118,8 +121,15 @@ def train(epoch):
             #imsave('refs_0_0.png', refs[0][0].cpu().data.numpy().reshape((28,28)))
             #imsave('recs_0_0.png', recs[0][0].cpu().data.numpy().reshape((28,28)))
 
+            acc = y_pred_noisy.data.max(1)[1].eq(label.data).cpu().sum() / len(data)
             step = (epoch-1) * len(train_loader) + batch_idx
+            sup_loss = sl.data[0]
+            uns_loss = ul.data[0]
+
             logger.scalar_summary('loss', loss.data[0], step)
+            logger.scalar_summary('acc', acc, step)
+            logger.scalar_summary('sup_loss', sup_loss, step)
+            logger.scalar_summary('dae_loss', uns_loss, step)
             logger.image_summary('recs', recs[0][0].cpu().view(-1,28,28).data.numpy(), step)
 
             def to_np(x): return x.data.cpu().numpy()
@@ -134,9 +144,9 @@ def train(epoch):
                 'batches': len(train_loader.dataset),
                 'bperc': 100. * batch_idx / len(train_loader),
                 'loss': loss.data[0] / len(data),
-                'sup': sl.data[0],
-                'dae': ul.data[0],
-                'acc': y_pred_noisy.data.max(1)[1].eq(label.data).cpu().sum() / len(data),
+                'sup': sup_loss,
+                'dae': uns_loss,
+                'acc': acc,
             }))
     tt = time.time()
 
@@ -171,6 +181,8 @@ def validate(epoch):
         'n': n,
         'accperc': correct / n,
     }))
+    
+    logger.scalar_summary('val_loss', total_loss.data[0], step)
 
 def test(epoch):
     model.eval()
