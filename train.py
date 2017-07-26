@@ -31,6 +31,8 @@ parser.add_argument('--seed', type=int, default=1, metavar='S',
 parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                     help='how many batches to wait before logging training status')
 parser.add_argument('--batchnorm', choices=['off','decoder','encoder','all'], default='off')
+parser.add_argument('--num-supervised', type=int, default=-1,
+                    help='Number of supervised samples. The default is to use all available labels.')
 parser.add_argument('--name', default='', type=str)
 
 args = parser.parse_args()
@@ -40,23 +42,24 @@ torch.manual_seed(args.seed)
 if args.cuda:
     torch.cuda.manual_seed(args.seed)
 
-
 SKIP_LABEL = -1
+
 
 class SemiSupervisedDataset(torch.utils.data.Dataset):
     def __init__(self, data_source, num_supervised):
         self.dataset = data_source
         self.num_supervised = num_supervised
+        self.num_classes = 10
         self.supervised_indices = self.collect_supervised_samples(num_supervised)
 
     def collect_supervised_samples(self, num_supervised):
-        num_classes = 10
-        counts = {n:0 for n in range(num_classes)}
-        indices = {n:[] for n in range(num_classes)}
-        target_len = num_supervised//num_classes
+        if num_supervised < 0:
+            return np.arange(len(self.dataset))
+        indices = {n:[] for n in range(self.num_classes)}
+        target_len = num_supervised//self.num_classes
 
         for i in torch.randperm(len(self.dataset)):
-            if all([len(indices[n]) == target_len for n in counts]):
+            if all([len(indices[n]) == target_len for n in indices]):
                 break
             y = self.dataset[i][1]
             if len(indices[y]) < target_len:
@@ -75,10 +78,11 @@ class SemiSupervisedDataset(torch.utils.data.Dataset):
         else:
             return self.dataset[i][0], SKIP_LABEL
 
+
 kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
 train_dataset = datasets.MNIST('../data', train=True, download=True, transform=transforms.ToTensor())
 train_loader = torch.utils.data.DataLoader(
-    SemiSupervisedDataset(train_dataset, 100),
+    SemiSupervisedDataset(train_dataset, args.num_supervised),
     sampler=torch.utils.data.sampler.SubsetRandomSampler(list(range(0,args.train_samples))),
     batch_size=args.batch_size, shuffle=True, **kwargs)
 val_loader = torch.utils.data.DataLoader(
@@ -89,11 +93,9 @@ test_loader = torch.utils.data.DataLoader(
     datasets.MNIST('../data', train=False, transform=transforms.ToTensor()),
     batch_size=args.batch_size, shuffle=True, **kwargs)
 
-
 model = LN(batchnorm_mode=args.batchnorm, cuda=args.cuda, noise_std=args.noise_sigma)
 if args.cuda:
     model.cuda()
-
 
 nll = nn.NLLLoss()
 mse = nn.MSELoss()
