@@ -114,8 +114,9 @@ class LN(nn.Module):
     def __init__(self, batchnorm_mode='off', parallel_encoder=False, noise_std=0.3, cuda=False):
         super(LN, self).__init__()
 
-        self.batchnorm_mode = []
+        self.use_cuda = cuda
 
+        self.batchnorm_mode = []
         if batchnorm_mode == 'all':
             self.batchnorm_mode = ['encoder','decoder']
         elif batchnorm_mode == 'decoder':
@@ -154,13 +155,13 @@ class LN(nn.Module):
         if 'encoder' in self.batchnorm_mode:
             for i in range(len(self.layers)):
                 self.bnorms[i] = TwoStepBatchNorm(sizes[i])
-                if self.cuda: 
+                if self.use_cuda:
                     self.bnorms[i].cuda()
 
         if 'decoder' in self.batchnorm_mode:
             for i in range(len(self.decoders)):
                 self.decbnorms[i] = nn.BatchNorm1d(decsizes[i], affine=False)
-                if self.cuda:
+                if self.use_cuda:
                     self.decbnorms[i].cuda()
 
 
@@ -186,7 +187,7 @@ class LN(nn.Module):
 
     def noise(self, x, noise_std):
         noise = Variable(torch.randn(x.size()) * noise_std)
-        if self.cuda:
+        if self.use_cuda:
             noise = noise.cuda()
         return x + noise
 
@@ -201,7 +202,7 @@ class LN(nn.Module):
         else:
             z_mu, z_std = 0, 1
             gamma, beta = 1, 0
-    
+
         z = self.noise(z, noise_std) if noise_std > 0 else z
 
         h = z * gamma + beta
@@ -287,7 +288,7 @@ class LN(nn.Module):
                 l2_recon, _ = self.decode(self.d3, dbnorms[0], self.g2, l3_recon, e_noisy[2], e_noisy_stat[2])
                 l1_recon, _ = self.decode(self.d2, dbnorms[1], self.g1, l2_recon, e_noisy[1], e_noisy_stat[1])
                 l0_recon, _ = self.decode(self.d1, dbnorms[2], self.g0, l1_recon, e_noisy[0], e_noisy_stat[0])
-            
+
             x = l0_recon
 
             samples.append(x)

@@ -17,6 +17,7 @@ parser.add_argument('--batch-size', type=int, default=128, metavar='N',
 parser.add_argument('--train-samples', type=int, default=50000)
 parser.add_argument('--validation-samples', type=int, default=10000)
 parser.add_argument('--noise-sigma', type=float, default=0.3)
+parser.add_argument('--from-target', action='store_true')
 parser.add_argument('--samples-j', type=int, default=1, metavar='N')
 parser.add_argument('--samples-k', type=int, default=1, metavar='N')
 parser.add_argument('--class', dest='cls', type=int, default=2, metavar='N')
@@ -57,9 +58,12 @@ test_loader = torch.utils.data.DataLoader(
     batch_size=args.batch_size, shuffle=True, **kwargs)
 
 
-model = torch.load(args.checkpoint.name)
 if args.cuda:
+    model = torch.load(args.checkpoint.name)
     model.cuda()
+else:
+    model = torch.load(args.checkpoint.name, map_location={'cuda:0':'cpu'})
+    model.use_cuda = False
 
 model.eval()
 
@@ -82,7 +86,6 @@ model.noise_std = args.noise_sigma
 #from scipy.misc import imsave
 #imsave('sample.png', sample.cpu().data.numpy().reshape((28,28)))
 
-
 from scipy.misc import imsave
 
 batch_data, batch_labels = list(train_loader)[0]
@@ -94,19 +97,20 @@ example = batch_data[0].view(-1, 784)
 
 print(example)
 
-samples = model.sample_by_example(example, k=args.samples_k)
+if args.from_target:
+    samples = model.sample_z(z, args.samples_k)
+else:
+    samples = model.sample_by_example(example, k=args.samples_k)
 
 if args.prefix:
     prefix = '{}_example_sample'.format(args.prefix)
 else:
     prefix = 'example_sample'
 
-
 directory = os.path.dirname(prefix)
 
 if directory:
     os.system('mkdir -p {}'.format(directory))
-
 
 imsave('{}_example.png'.format(prefix), example.cpu().data.numpy().reshape(28,28))
 

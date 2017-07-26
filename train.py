@@ -1,5 +1,6 @@
 from __future__ import print_function
 import argparse
+import numpy as np
 import torch
 import torch.utils.data
 import torch.nn as nn
@@ -40,10 +41,44 @@ if args.cuda:
     torch.cuda.manual_seed(args.seed)
 
 
+SKIP_LABEL = -1
+
+class SemiSupervisedDataset(torch.utils.data.Dataset):
+    def __init__(self, data_source, num_supervised):
+        self.dataset = data_source
+        self.num_supervised = num_supervised
+        self.supervised_indices = self.collect_supervised_samples(num_supervised)
+
+    def collect_supervised_samples(self, num_supervised):
+        num_classes = 10
+        counts = {n:0 for n in range(num_classes)}
+        indices = {n:[] for n in range(num_classes)}
+        target_len = num_supervised//num_classes
+
+        for i in torch.randperm(len(self.dataset)):
+            if all([len(indices[n]) == target_len for n in counts]):
+                break
+            y = self.dataset[i][1]
+            if len(indices[y]) < target_len:
+                indices[y].append(i)
+
+        assert sum([len(indices[n]) for n in indices]) == num_supervised
+        assert all([len(indices[n]) == target_len for n in indices])
+        return np.concatenate(list(indices.values()))
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, i):
+        if i in self.supervised_indices:
+            return self.dataset[i]
+        else:
+            return self.dataset[i][0], SKIP_LABEL
+
 kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
+train_dataset = datasets.MNIST('../data', train=True, download=True, transform=transforms.ToTensor())
 train_loader = torch.utils.data.DataLoader(
-    datasets.MNIST('../data', train=True, download=True,
-                   transform=transforms.ToTensor()),
+    SemiSupervisedDataset(train_dataset, 100),
     sampler=torch.utils.data.sampler.SubsetRandomSampler(list(range(0,args.train_samples))),
     batch_size=args.batch_size, shuffle=True, **kwargs)
 val_loader = torch.utils.data.DataLoader(
@@ -63,10 +98,16 @@ if args.cuda:
 nll = nn.NLLLoss()
 mse = nn.MSELoss()
 
-
 def ln_loss_function(recons, refs, weights, y_pred, y_true):
-    sup = nll(y_pred, y_true)
     uns = 0
+
+    sup_idx = y_true != SKIP_LABEL
+    if len(y_true[sup_idx]) > 0:
+        sup_idx_pred = sup_idx.unsqueeze(1).expand(y_pred.size())
+        sup = nll(y_pred[sup_idx_pred].view(-1, 10), y_true[sup_idx])
+    else:
+        sup = Variable(torch.FloatTensor([0]))
+        sup = sup.cuda() if args.cuda else sup
 
     for i, _ in enumerate(recons):
         if args.loss_normalization == 'ladder':
@@ -121,7 +162,15 @@ def train(epoch):
             #imsave('refs_0_0.png', refs[0][0].cpu().data.numpy().reshape((28,28)))
             #imsave('recs_0_0.png', recs[0][0].cpu().data.numpy().reshape((28,28)))
 
-            acc = y_pred_noisy.data.max(1)[1].eq(label.data).cpu().sum() / len(data)
+            #acc = y_pred_noisy.data.max(1)[1].eq(label.data).cpu().sum() / len(data)
+
+            sup_idx = label != SKIP_LABEL
+            if len(label[sup_idx]) > 0:
+                sup_idx_pred = sup_idx.unsqueeze(1).expand(y_pred_noisy.size())
+                acc = y_pred_noisy[sup_idx_pred].view(-1,10).data.max(1)[1].eq(label[sup_idx].data).cpu().sum() / len(sup_idx)
+            else:
+                acc = 0
+
             step = (epoch-1) * len(train_loader) + batch_idx
             sup_loss = sl.data[0]
             uns_loss = ul.data[0]
@@ -181,8 +230,8 @@ def validate(epoch):
         'n': n,
         'accperc': correct / n,
     }))
-    
-    logger.scalar_summary('val_loss', total_loss.data[0], step)
+
+    logger.scalar_summary('val_loss', total_loss, epoch)
 
 def test(epoch):
     model.eval()
